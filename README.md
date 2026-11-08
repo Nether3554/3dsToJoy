@@ -5,10 +5,12 @@
 
 # Setup
 1. Download 3dsToJoy.3dsx
-2. Download 3dsToJoy.exe (not ready yet)
-3. Open the app on your PC
-4. Enter your computers IP Adress into the 3ds
-5. It works!
+2. Download 3dsToJoy-setup.exe (not ready yet)
+3. Install 3dsToJoy on your PC (not ready yet)
+4. Install 3dsToJoy on your 3DS
+5. Open the app on your PC
+6. Enter your computers IP Adress into the 3ds
+7. It works!
 
 # Compiling
 You need to get devkit pro. In MSYS2 use "MAKE" to compile it.
