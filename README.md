@@ -1,5 +1,6 @@
 # 3dsToJoy
 3DS as a PC controller over Wi-Fi.
+
 ## DISCLAIMER!!! AI was used to make the 3DS app cause I don't know how to code in C or C++. The PC app was made 100% by me. no AI was used for creating that app.
 
 # Setup
