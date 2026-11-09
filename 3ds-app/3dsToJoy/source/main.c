@@ -3,16 +3,19 @@
  *
  * Co robi:
  *   - przy pierwszym uruchomieniu pyta o adres IP komputera (klawiatura systemowa),
- *   - zapisuje go w sdmc:/3ds/3dsToJoy/config.txt,
+ *   - zapisuje IP i ustawienia w sdmc:/3ds/3dsToJoy/config.txt,
  *   - ok. 60 razy na sekunde wysyla pakiet UDP ze stanem przyciskow, galek,
  *     ekranu dotykowego, zyroskopu i akcelerometru na <IP>:5000.
  *
  * Gorny ekran: podglad tego, co jest wysylane.
  * Dolny ekran: touchpad (cala powierzchnia), kropka pod palcem.
- *              Zielona ramka = wysylanie, pomaranczowa = pauza (menu).
+ *              Zielona ramka = wysylanie, pomaranczowa = pauza (menu),
+ *              czerwony "X" = dotyk wylaczony.
  *
  * Menu: przytrzymaj SELECT+START przez ok. 1 s (wysylanie sie zatrzymuje).
- *   A = zmien IP, B = wznow, START = wyjdz.   HOME tez zamyka aplikacje.
+ *   D-pad gora/dol = ruch kursora, A = wybierz/przelacz, B = wznow.
+ *   Opcje: tryb pada (DS4 / XInput), zyroskop+akcelerometr ON/OFF,
+ *          dotyk ON/OFF, zmiana IP, wznow, wyjscie.   HOME tez zamyka aplikacje.
  */
 
 #include <3ds.h>
@@ -28,7 +31,7 @@
 #include <arpa/inet.h>
 
 #define APP_NAME          "3dsToJoy"
-#define APP_VERSION       "0.2"
+#define APP_VERSION       "0.3"
 #define PORT              5000
 #define SOC_BUF_SIZE      0x100000
 #define CONFIG_DIR        "sdmc:/3ds/3dsToJoy"
@@ -39,12 +42,17 @@
  * (hidKeysHeld zawiera tez bity "galka jako D-pad", ktore tu pomijamy.) */
 #define KEY_MASK (0x0FFF | KEY_ZL | KEY_ZR | KEY_TOUCH)
 
+/* Bity pola flags w pakiecie (ustawienia wybrane w menu na 3DS) */
+#define FLAG_DS4    (1 << 0)   /* 1 = wirtualny DS4, 0 = XInput (Xbox 360) */
+#define FLAG_GYRO   (1 << 1)   /* 1 = zyroskop + akcelerometr wlaczone     */
+#define FLAG_TOUCH  (1 << 2)   /* 1 = dotyk wlaczony                       */
+
 /*
- * Format pakietu (little-endian, 34 bajty).
- * Python: struct.Struct("<4sHIhhhhHHhhhhhh")
+ * Format pakietu (little-endian, 36 bajtow).
+ * Python: struct.Struct("<4sHIhhhhHHhhhhhhH")
  */
 typedef struct __attribute__((packed)) {
-    char     magic[4];             /* "3DJ2"                                   */
+    char     magic[4];             /* "3DJ3"                                   */
     uint16_t seq;                  /* numer pakietu (zawija sie), do ignorowania starych */
     uint32_t keys;                 /* bity KEY_* z libctru                     */
     int16_t  cpad_x, cpad_y;       /* Circle Pad, ok. -156..156                */
@@ -52,9 +60,45 @@ typedef struct __attribute__((packed)) {
     uint16_t touch_x, touch_y;     /* ekran dotykowy 320x240, 0 gdy brak dotyku */
     int16_t  gyro_x, gyro_y, gyro_z;    /* zyroskop (surowe wartosci)          */
     int16_t  accel_x, accel_y, accel_z; /* akcelerometr (surowe wartosci)      */
+    uint16_t flags;                /* FLAG_* - tryb i wlaczone funkcje         */
 } Packet;
 
-_Static_assert(sizeof(Packet) == 34, "Packet musi miec 34 bajty");
+_Static_assert(sizeof(Packet) == 36, "Packet musi miec 36 bajtow");
+
+/* ------------------------------------------------------------------ */
+/* Ustawienia                                                          */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    bool ds4;     /* true = DS4, false = XInput */
+    bool gyro;    /* zyroskop + akcelerometr    */
+    bool touch;   /* dotyk                      */
+} Settings;
+
+static Settings g_set = { true, true, true };   /* domyslnie: DS4, wszystko wlaczone */
+
+static uint16_t current_flags(void)
+{
+    return (g_set.ds4   ? FLAG_DS4   : 0)
+         | (g_set.gyro  ? FLAG_GYRO  : 0)
+         | (g_set.touch ? FLAG_TOUCH : 0);
+}
+
+/* Sensory ruchu wlaczamy tylko, gdy sa potrzebne (oszczednosc baterii). */
+static bool s_motion_on = false;
+
+static void motion_set(bool on)
+{
+    if (on == s_motion_on) return;
+    if (on) {
+        HIDUSER_EnableGyroscope();
+        HIDUSER_EnableAccelerometer();
+    } else {
+        HIDUSER_DisableAccelerometer();
+        HIDUSER_DisableGyroscope();
+    }
+    s_motion_on = on;
+}
 
 /* ------------------------------------------------------------------ */
 /* IP i konfiguracja                                                   */
@@ -70,6 +114,18 @@ static bool parse_ip(const char *s, uint32_t *out)
     return true;
 }
 
+static void parse_setting(const char *line)
+{
+    if      (!strcmp(line, "mode=ds4"))    g_set.ds4   = true;
+    else if (!strcmp(line, "mode=xinput")) g_set.ds4   = false;
+    else if (!strcmp(line, "gyro=1"))      g_set.gyro  = true;
+    else if (!strcmp(line, "gyro=0"))      g_set.gyro  = false;
+    else if (!strcmp(line, "touch=1"))     g_set.touch = true;
+    else if (!strcmp(line, "touch=0"))     g_set.touch = false;
+}
+
+/* config.txt: 1. linia = IP, kolejne = ustawienia (mode=, gyro=, touch=).
+ * Stary plik z samym IP tez zadziala (reszta zostaje domyslna). */
 static bool load_config(char *ip, size_t len)
 {
     FILE *f = fopen(CONFIG_FILE, "r");
@@ -77,16 +133,23 @@ static bool load_config(char *ip, size_t len)
 
     char line[64] = {0};
     bool ok = fgets(line, sizeof line, f) != NULL;
+
+    if (ok) {
+        line[strcspn(line, "\r\n")] = '\0';
+
+        uint32_t tmp;
+        ok = parse_ip(line, &tmp);
+        if (ok) {
+            snprintf(ip, len, "%s", line);
+            while (fgets(line, sizeof line, f)) {
+                line[strcspn(line, "\r\n")] = '\0';
+                parse_setting(line);
+            }
+        }
+    }
+
     fclose(f);
-    if (!ok) return false;
-
-    line[strcspn(line, "\r\n")] = '\0';
-
-    uint32_t tmp;
-    if (!parse_ip(line, &tmp)) return false;
-
-    snprintf(ip, len, "%s", line);
-    return true;
+    return ok;
 }
 
 static void save_config(const char *ip)
@@ -96,7 +159,8 @@ static void save_config(const char *ip)
 
     FILE *f = fopen(CONFIG_FILE, "w");
     if (!f) return;
-    fprintf(f, "%s\n", ip);
+    fprintf(f, "%s\nmode=%s\ngyro=%d\ntouch=%d\n",
+            ip, g_set.ds4 ? "ds4" : "xinput", g_set.gyro ? 1 : 0, g_set.touch ? 1 : 0);
     fclose(f);
 }
 
@@ -137,26 +201,24 @@ static bool prompt_ip(char *ip, size_t len)
 /* Pakiety                                                             */
 /* ------------------------------------------------------------------ */
 
+/* Pusty pakiet (nic wcisniete) - ale z AKTUALNYMI flagami, zeby PC nie
+ * przelaczylo trybu pada przez przypadek. */
 static void make_neutral(Packet *p, uint16_t seq)
 {
     memset(p, 0, sizeof *p);
-    memcpy(p->magic, "3DJ2", 4);
-    p->seq = seq;
+    memcpy(p->magic, "3DJ3", 4);
+    p->seq   = seq;
+    p->flags = current_flags();
 }
 
 static void fill_packet(Packet *p, uint16_t seq)
 {
     circlePosition cpad, cstick;
     touchPosition  touch;
-    angularRate    gyro;
-    accelVector    accel;
 
     u32 held = hidKeysHeld();
     hidCircleRead(&cpad);
     hidCstickRead(&cstick);
-    hidTouchRead(&touch);
-    hidGyroRead(&gyro);
-    hidAccelRead(&accel);
 
     make_neutral(p, seq);
     p->keys     = held & KEY_MASK;
@@ -164,14 +226,29 @@ static void fill_packet(Packet *p, uint16_t seq)
     p->cpad_y   = cpad.dy;
     p->cstick_x = cstick.dx;
     p->cstick_y = cstick.dy;
-    p->touch_x  = (held & KEY_TOUCH) ? touch.px : 0;
-    p->touch_y  = (held & KEY_TOUCH) ? touch.py : 0;
-    p->gyro_x   = gyro.x;
-    p->gyro_y   = gyro.y;
-    p->gyro_z   = gyro.z;
-    p->accel_x  = accel.x;
-    p->accel_y  = accel.y;
-    p->accel_z  = accel.z;
+
+    if (g_set.touch) {
+        if (held & KEY_TOUCH) {
+            hidTouchRead(&touch);
+            p->touch_x = touch.px;
+            p->touch_y = touch.py;
+        }
+    } else {
+        p->keys &= ~KEY_TOUCH;          /* dotyk wylaczony - PC o nim nie wie */
+    }
+
+    if (g_set.gyro) {
+        angularRate gyro;
+        accelVector accel;
+        hidGyroRead(&gyro);
+        hidAccelRead(&accel);
+        p->gyro_x  = gyro.x;
+        p->gyro_y  = gyro.y;
+        p->gyro_z  = gyro.z;
+        p->accel_x = accel.x;
+        p->accel_y = accel.y;
+        p->accel_z = accel.z;
+    }
 }
 
 static bool send_packet(int sock, const struct sockaddr_in *dest, const Packet *p)
@@ -200,7 +277,8 @@ static void draw_main(const char *ip)
     consoleClear();
     printf("\x1b[1;1H%s v%s", APP_NAME, APP_VERSION);
     printf("\x1b[3;1HTarget: %s:%d", ip, PORT);
-    printf("\x1b[5;1HStreaming controller input...");
+    printf("\x1b[4;1HMode:   %s", g_set.ds4 ? "DS4" : "XInput (Xbox 360)");
+    printf("\x1b[5;1HGyro: %s   Touch: %s", g_set.gyro ? "ON" : "OFF", g_set.touch ? "ON" : "OFF");
     printf("\x1b[19;1HHold SELECT+START for 1 s = menu");
     printf("\x1b[20;1HHOME = exit");
 
@@ -240,14 +318,31 @@ static void draw_counters(unsigned long sent, unsigned long errors)
         printf("\x1b[8;1HNo packets going out - is Wi-Fi on?");
 }
 
-static void draw_menu(const char *ip)
+/* ------------------------------------------------------------------ */
+/* Menu                                                                */
+/* ------------------------------------------------------------------ */
+
+enum { MI_MODE, MI_GYRO, MI_TOUCH, MI_IP, MI_RESUME, MI_QUIT, MI_COUNT };
+
+static void draw_menu(const char *ip, int sel)
 {
+    char item[MI_COUNT][40];
+    snprintf(item[MI_MODE],   sizeof item[0], "Controller:   %s", g_set.ds4 ? "DS4" : "XInput (Xbox 360)");
+    snprintf(item[MI_GYRO],   sizeof item[0], "Gyro + accel: %s", g_set.gyro ? "ON" : "OFF");
+    snprintf(item[MI_TOUCH],  sizeof item[0], "Touchpad:     %s", g_set.touch ? "ON" : "OFF");
+    snprintf(item[MI_IP],     sizeof item[0], "Change PC IP...");
+    snprintf(item[MI_RESUME], sizeof item[0], "Resume");
+    snprintf(item[MI_QUIT],   sizeof item[0], "Quit");
+
     consoleClear();
     printf("\x1b[1;1H%s - MENU (input paused)", APP_NAME);
     printf("\x1b[3;1HTarget: %s:%d", ip, PORT);
-    printf("\x1b[6;1HA     - change PC IP");
-    printf("\x1b[7;1HB     - resume");
-    printf("\x1b[8;1HSTART - quit");
+
+    for (int i = 0; i < MI_COUNT; i++)
+        printf("\x1b[%d;1H%c %s", 6 + i, i == sel ? '>' : ' ', item[i]);
+
+    printf("\x1b[15;1HD-pad up/down: move   A: select");
+    printf("\x1b[16;1HB: resume");
 }
 
 /* ------------------------------------------------------------------ */
@@ -263,6 +358,7 @@ static void draw_menu(const char *ip)
 #define COL_PAUSED  0xE08020
 #define COL_RING    0x40A0FF
 #define COL_DOT     0xFFFFFF
+#define COL_OFF     0x70283A
 
 /* Framebuffer 3DS jest obrocony: kolumny po 240 pikseli, oś Y liczona od dolu,
  * format BGR (3 bajty na piksel). x,y podajemy normalnie (0,0 = lewy gorny rog). */
@@ -299,7 +395,7 @@ static void clear_screen(u8 *fb, u32 rgb)
     }
 }
 
-static void draw_pad(bool touching, int tx, int ty, bool paused)
+static void draw_pad(bool touching, int tx, int ty, bool paused, bool touch_enabled)
 {
     u8 *fb = gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, NULL, NULL);
 
@@ -309,11 +405,22 @@ static void draw_pad(bool touching, int tx, int ty, bool paused)
     fill_rect(fb, SCREEN_W / 2 - 1, 0, 2, SCREEN_H, COL_GRID);
     fill_rect(fb, 0, SCREEN_H / 2 - 1, SCREEN_W, 2, COL_GRID);
 
+    /* dotyk wylaczony: czerwony "X" przez caly pad */
+    if (!touch_enabled) {
+        for (int y = 0; y < SCREEN_H; y++) {
+            int x = y * SCREEN_W / SCREEN_H;
+            for (int t = -1; t <= 1; t++) {
+                put_px(fb, x + t, y, COL_OFF);
+                put_px(fb, SCREEN_W - 1 - x + t, y, COL_OFF);
+            }
+        }
+    }
+
     /* ramka: zielona = wysylamy, pomaranczowa = pauza */
     frame_rect(fb, 0, 0, SCREEN_W, SCREEN_H, 3, paused ? COL_PAUSED : COL_OK);
 
     /* kropka pod palcem */
-    if (touching && !paused) {
+    if (touch_enabled && touching && !paused) {
         frame_rect(fb, tx - 8, ty - 8, 17, 17, 2, COL_RING);
         fill_rect(fb, tx - 3, ty - 3, 7, 7, COL_DOT);
     }
@@ -370,10 +477,11 @@ static void run(void)
     parse_ip(ip, &ip_host);
     dest.sin_addr.s_addr = htonl(ip_host);
 
-    HIDUSER_EnableGyroscope();
-    HIDUSER_EnableAccelerometer();
+    motion_set(g_set.gyro);
 
     bool          menu   = false;
+    bool          quit   = false;
+    int           sel    = 0;
     int           combo  = 0;
     int           frame  = 0;
     uint16_t      seq    = 0;
@@ -402,7 +510,8 @@ static void run(void)
                 }
                 menu  = true;
                 combo = 0;
-                draw_menu(ip);
+                sel   = 0;
+                draw_menu(ip, sel);
             } else {
                 Packet p;
                 fill_packet(&p, seq++);
@@ -412,31 +521,59 @@ static void run(void)
                 if (++frame % 30 == 0) draw_counters(sent, errors);
             }
         } else {
+            bool changed = false;
+
+            if (down & KEY_DUP)   { sel = (sel + MI_COUNT - 1) % MI_COUNT; changed = true; }
+            if (down & KEY_DDOWN) { sel = (sel + 1) % MI_COUNT;            changed = true; }
+
             if (down & KEY_A) {
-                if (prompt_ip(ip, sizeof ip)) {
+                switch (sel) {
+                case MI_MODE:
+                    g_set.ds4 = !g_set.ds4;
                     save_config(ip);
-                    if (parse_ip(ip, &ip_host))
-                        dest.sin_addr.s_addr = htonl(ip_host);
+                    break;
+                case MI_GYRO:
+                    g_set.gyro = !g_set.gyro;
+                    motion_set(g_set.gyro);
+                    save_config(ip);
+                    break;
+                case MI_TOUCH:
+                    g_set.touch = !g_set.touch;
+                    save_config(ip);
+                    break;
+                case MI_IP:
+                    if (prompt_ip(ip, sizeof ip)) {
+                        save_config(ip);
+                        if (parse_ip(ip, &ip_host))
+                            dest.sin_addr.s_addr = htonl(ip_host);
+                    }
+                    break;
+                case MI_RESUME:
+                    menu = false;
+                    break;
+                case MI_QUIT:
+                    quit = true;
+                    break;
                 }
-                draw_menu(ip);
+                changed = true;
             }
-            if (down & KEY_B) {
-                menu = false;
-                draw_main(ip);
-            }
-            if (down & KEY_START) break;
+            if (down & KEY_B) menu = false;
+
+            if (quit) break;
+
+            if (!menu)        draw_main(ip);          /* wznowienie */
+            else if (changed) draw_menu(ip, sel);
         }
 
         /* dolny ekran: touchpad */
         touchPosition tp;
         hidTouchRead(&tp);
-        draw_pad((held & KEY_TOUCH) != 0, tp.px, tp.py, menu);
+        draw_pad((held & KEY_TOUCH) != 0, tp.px, tp.py, menu, g_set.touch);
 
         present();
     }
 
-    HIDUSER_DisableAccelerometer();
-    HIDUSER_DisableGyroscope();
+    motion_set(false);
     close(sock);
 }
 
